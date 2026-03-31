@@ -1,0 +1,45 @@
+{
+  "project": "gigs_competitor_crawling",
+  "description": "원티드긱스 경쟁사(위시켓, 이랜서, 크몽) 프로젝트 크롤링",
+  "schedule": "매주 월요일 09:00 KST",
+  "platforms": {
+    "elancer": {
+      "crawler": "crawlers/elancer_crawler.py",
+      "method": "API (requests)",
+      "api_url": "https://api.elancer.co.kr/api/pjt/get_list"
+    },
+    "wishket": {
+      "crawler": "crawlers/wishket_crawler.py",
+      "method": "Playwright (headless browser)",
+      "base_url": "https://www.wishket.com/project/"
+    },
+    "kmong": {
+      "crawler": "crawlers/kmong_crawler.py",
+      "method": "Playwright (headless browser)",
+      "base_url": "https://enterprise.kmong.com/projects"
+    }
+  },
+  "output": {
+    "csv_pattern": "{platform}_{YYMMDD}.csv",
+    "merged_csv": "gigs_merged_{YYMMDD}.csv",
+    "columns": [
+      "No.",
+      "플랫폼",
+      "프로젝트 제목",
+      "등록일",
+      "금액",
+      "예상기간",
+      "기간제/외주",
+      "직무",
+      "스킬",
+      "근무지",
+      "수집일시"
+    ]
+  },
+  "secrets_required": [
+    "GCP_SA_JSON",
+    "SPREADSHEET_ID",
+    "SHEET_GID",
+    "DRIVE_FOLDER_ID"
+  ]
+}
