@@ -1,0 +1,101 @@
+name: "Gigs Competitor → CSV → Sheet"
+
+on:
+  schedule:
+    - cron: "0 0 * * 1"
+  workflow_dispatch:
+    inputs:
+      skip_wishket:
+        description: "위시켓 크롤링 건너뛰기"
+        type: boolean
+        default: false
+      skip_elancer:
+        description: "이랜서 크롤링 건너뛰기"
+        type: boolean
+        default: false
+      skip_kmong:
+        description: "크몽 크롤링 건너뛰기"
+        type: boolean
+        default: false
+
+concurrency:
+  group: gigs-competitor-crawl
+  cancel-in-progress: false
+
+env:
+  OUT_DIR: out
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  crawl-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: playwright install chromium --with-deps
+
+      - name: Write GCP service account JSON
+        run: echo '${{ secrets.GCP_SA_JSON }}' > sa.json
+
+      - name: Create output directory
+        run: mkdir -p out/debug
+
+      - name: "Crawl: 이랜서"
+        if: inputs.skip_elancer != true
+        run: python crawlers/elancer_crawler.py
+        env:
+          OUT_DIR: out
+
+      - name: "Crawl: 위시켓"
+        if: inputs.skip_wishket != true
+        run: python crawlers/wishket_crawler.py
+        env:
+          OUT_DIR: out
+
+      - name: "Crawl: 크몽"
+        if: inputs.skip_kmong != true
+        run: python crawlers/kmong_crawler.py
+        env:
+          OUT_DIR: out
+
+      - name: List collected CSVs
+        run: |
+          echo "=== Collected CSV files ==="
+          ls -la out/*.csv 2>/dev/null || echo "No CSV files found"
+
+      - name: "Pipeline: CSV → Google Sheet"
+        run: python pipeline/gsheet_pipeline.py
+        env:
+          OUT_DIR: out
+          SA_JSON_PATH: sa.json
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SHEET_GID: ${{ secrets.SHEET_GID }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+
+      - name: Upload CSV artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gigs-artifacts
+          path: |
+            out/*.csv
+            out/debug/
+          retention-days: 30
+
+      - name: Cleanup service account
+        if: always()
+        run: rm -f sa.json
