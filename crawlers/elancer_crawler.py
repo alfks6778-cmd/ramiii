@@ -1,156 +1,220 @@
 """
-이랜서(Elancer) 크롤러 — API 기반
-PRD 표준: CSV 출력 → pipeline에서 Google Sheet 반영
+이랜서(Elancer) 크롤러 — Playwright 기반 (v3 scrape)
+- API가 HTML 반환하므로 웹페이지 직접 스크레이핑
+- 후보 URL: /project, /project_list, /pjt 등 시도
+- DOM 자동분석
 """
 
+import asyncio
 import csv
 import json
 import os
-import sys
-import math
-import requests
+import re
 from datetime import datetime
+from playwright.async_api import async_playwright
 
-# ── 설정 ────────────────────────────────────────────────
-API_URL = "https://api.elancer.co.kr/api/pjt/get_list"
-PAGE_SIZE = 20
-MAX_PAGES = 50  # 안전 가드
-
+CANDIDATE_URLS = [
+    "https://www.elancer.co.kr/project",
+    "https://www.elancer.co.kr/project_list",
+    "https://www.elancer.co.kr/pjt",
+    "https://www.elancer.co.kr/project/list",
+    "https://www.elancer.co.kr/",
+]
+PAGE_TIMEOUT = 60000
+MAX_PAGES = 10
 HEADERS_ROW = [
     "No.", "플랫폼", "프로젝트 제목", "등록일", "금액",
     "예상기간", "기간제/외주", "직무", "스킬", "근무지", "수집일시",
 ]
 
 OUT_DIR = os.environ.get("OUT_DIR", "out")
+DEBUG_DIR = os.path.join(OUT_DIR, "debug")
 TODAY = datetime.now().strftime("%y%m%d")
 CSV_PATH = os.path.join(OUT_DIR, f"elancer_{TODAY}.csv")
 
 
-# ── 직무 매핑 ───────────────────────────────────────────
-DUTY_MAP = {
-    "1": "웹개발", "2": "앱개발", "3": "퍼블리싱",
-    "4": "디자인", "5": "기획", "6": "데이터",
-    "7": "인프라", "8": "QA/테스트", "9": "PM/PMO",
-    "10": "기타",
-}
+async def dump_debug(page, name: str):
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    try:
+        await page.screenshot(path=os.path.join(DEBUG_DIR, f"elancer_{name}.png"), full_page=True)
+        html = await page.content()
+        with open(os.path.join(DEBUG_DIR, f"elancer_{name}.html"), "w", encoding="utf-8") as f:
+            f.write(html)
+    except Exception as e:
+        print(f"[elancer] 디버그 저장 실패: {e}")
 
 
-def fetch_page(page: int) -> dict:
-    """이랜서 API 한 페이지 조회"""
-    payload = {
-        "pgNo": page,
-        "pgSize": PAGE_SIZE,
-        "sortBy": "latest",
-        "pjtState": "R",      # 모집중
+async def extract_cards(page) -> list:
+    """프로젝트 상세 링크를 찾아 카드 추출"""
+    return await page.evaluate("""() => {
+        const candidates = document.querySelectorAll('a');
+        const seen = new Set();
+        const result = [];
+        for (const a of candidates) {
+            const href = a.getAttribute('href') || '';
+            const pidMatch = href.match(/(?:pjt_no|project[_/](?:view)?|pjt[_/]view)[=/]?(\\d+)/i)
+                          || href.match(/\\/(?:project|pjt)\\/(\\d+)/i);
+            if (!pidMatch) continue;
+            const pid = pidMatch[1];
+            if (seen.has(pid)) continue;
+            seen.add(pid);
+            let node = a;
+            for (let i = 0; i < 6; i++) {
+                if (!node.parentElement) break;
+                node = node.parentElement;
+                if (node.innerText && node.innerText.length > 100) break;
+            }
+            result.push({
+                pid: pid,
+                href: href,
+                title: (a.innerText || a.getAttribute('title') || '').trim(),
+                text: (node.innerText || '').trim().slice(0, 1000),
+            });
+        }
+        return result;
+    }""")
+
+
+def parse_card(card: dict) -> dict:
+    text = card.get("text", "")
+    title = card.get("title") or ""
+    if not title:
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        title = lines[0] if lines else ""
+
+    amount = ""
+    m = re.search(r"(\d[\d,]*\s*만?\s*원(?:\s*~\s*\d[\d,]*\s*만?\s*원)?)", text)
+    if m:
+        amount = m.group(1).strip()
+
+    duration = ""
+    m = re.search(r"(\d+\s*(?:일|주|개월|달)(?:\s*~\s*\d+\s*(?:일|주|개월|달))?)", text)
+    if m:
+        duration = m.group(1).strip()
+
+    regdate = ""
+    m = re.search(r"(\d{4}[./-]\d{1,2}[./-]\d{1,2})", text)
+    if m:
+        regdate = m.group(1)
+
+    location = ""
+    m = re.search(r"(서울|경기|인천|부산|대구|대전|광주|울산|세종|강원|충[북남]|전[북남]|경[북남]|제주|재택|원격)", text)
+    if m:
+        location = m.group(0)
+
+    job = ""
+    for kw in ["개발", "디자인", "기획", "퍼블리싱", "데이터", "인프라", "QA", "PM"]:
+        if kw in text:
+            job = kw
+            break
+
+    return {
+        "title": title[:200],
+        "amount": amount,
+        "duration": duration,
+        "regdate": regdate,
+        "location": location,
+        "job": job,
     }
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Origin": "https://www.elancer.co.kr",
-        "Referer": "https://www.elancer.co.kr/",
-    }
-    resp = requests.post(API_URL, json=payload, headers=headers, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
 
 
-def parse_projects(data: dict) -> list[dict]:
-    """API 응답에서 프로젝트 리스트 파싱"""
-    items = data.get("data", {}).get("pjtList") or data.get("data", {}).get("list") or []
-    if not items and isinstance(data.get("data"), list):
-        items = data["data"]
-    return items
-
-
-def extract_row(item: dict, idx: int, collect_time: str) -> list:
-    """프로젝트 한 건 → 행 변환"""
-    # 직무 추출
-    duty_cd = str(item.get("dutyCd", "") or "")
-    job_role = DUTY_MAP.get(duty_cd, item.get("dutyNm", "") or "")
-
-    # 스킬 추출
-    skills_raw = item.get("skillNm") or item.get("langNm") or ""
-    if isinstance(skills_raw, list):
-        skills = ", ".join(str(s) for s in skills_raw)
-    else:
-        skills = str(skills_raw)
-
-    # 금액
-    amt_start = item.get("pjtAmtStart") or item.get("monthAmt") or ""
-    amt_end = item.get("pjtAmtEnd") or ""
-    if amt_start and amt_end and str(amt_start) != str(amt_end):
-        amount = f"{amt_start}~{amt_end}만원"
-    elif amt_start:
-        amount = f"{amt_start}만원"
-    else:
-        amount = "협의"
-
-    # 기간
-    duration_raw = item.get("pjtDuration") or item.get("expectMonth") or ""
-    duration = f"{duration_raw}개월" if duration_raw else "미정"
-
-    # 기간제/외주
-    pjt_type = item.get("pjtTypeNm") or item.get("workType") or ""
-
-    # 근무지
-    location = item.get("workPlace") or item.get("addr") or ""
-
-    return [
-        idx,
-        "이랜서",
-        item.get("pjtName") or item.get("title") or "",
-        item.get("regDt") or item.get("regDate") or "",
-        amount,
-        duration,
-        pjt_type,
-        job_role,
-        skills,
-        location,
-        collect_time,
-    ]
-
-
-def crawl() -> str:
-    """전체 수집 후 CSV 저장, CSV 경로 반환"""
+async def crawl():
     os.makedirs(OUT_DIR, exist_ok=True)
-    collect_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-    all_rows: list[list] = []
+    os.makedirs(DEBUG_DIR, exist_ok=True)
 
-    print("[elancer] 수집 시작")
+    rows = []
+    seen = set()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    for page in range(1, MAX_PAGES + 1):
-        try:
-            data = fetch_page(page)
-        except Exception as e:
-            print(f"[elancer] page {page} 요청 실패: {e}")
-            break
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            viewport={"width": 1440, "height": 900},
+            locale="ko-KR",
+        )
+        page = await context.new_page()
 
-        items = parse_projects(data)
-        if not items:
-            print(f"[elancer] page {page}: 데이터 없음 → 종료")
-            break
+        print("[elancer] 수집 시작")
+        working_url = None
+        for url in CANDIDATE_URLS:
+            try:
+                print(f"[elancer] 시도: {url}")
+                resp = await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
+                await page.wait_for_timeout(3000)
+                status = resp.status if resp else 0
+                print(f"[elancer]   status={status}")
+                if status and status < 400:
+                    test_cards = await extract_cards(page)
+                    print(f"[elancer]   테스트 카드 {len(test_cards)}개")
+                    if test_cards:
+                        working_url = url
+                        break
+                    elif url == CANDIDATE_URLS[0]:
+                        working_url = url
+            except Exception as e:
+                print(f"[elancer]   실패: {e}")
 
-        for item in items:
-            row = extract_row(item, len(all_rows) + 1, collect_time)
-            all_rows.append(row)
+        if not working_url:
+            print("[elancer] 접근 가능한 URL 없음")
+            await dump_debug(page, "no_url")
+            await browser.close()
+            with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
+                csv.writer(f).writerow(HEADERS_ROW)
+            return
 
-        total = data.get("data", {}).get("totalCnt") or data.get("data", {}).get("total") or 0
-        total_pages = math.ceil(int(total) / PAGE_SIZE) if total else page
-        print(f"[elancer] page {page}/{total_pages}  누적 {len(all_rows)}건")
+        print(f"[elancer] 사용 URL: {working_url}")
+        await dump_debug(page, "page1")
 
-        if page >= total_pages:
-            break
+        for pg in range(1, MAX_PAGES + 1):
+            if pg > 1:
+                sep = "&" if "?" in working_url else "?"
+                url = f"{working_url}{sep}page={pg}"
+                print(f"[elancer] page {pg}: {url}")
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
+                    await page.wait_for_timeout(3000)
+                except Exception as e:
+                    print(f"[elancer] page {pg} 실패: {e}")
+                    break
 
-    # CSV 쓰기
+            cards = await extract_cards(page)
+            print(f"[elancer] page {pg} 카드 {len(cards)}개")
+
+            if not cards:
+                await dump_debug(page, f"empty_p{pg}")
+                break
+
+            new_count = 0
+            for c in cards:
+                pid = c["pid"]
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                parsed = parse_card(c)
+                if not parsed["title"]:
+                    continue
+                rows.append([
+                    "", "이랜서", parsed["title"], parsed["regdate"], parsed["amount"],
+                    parsed["duration"], "", parsed["job"], "", parsed["location"], now_str,
+                ])
+                new_count += 1
+
+            if new_count == 0:
+                print(f"[elancer] page {pg} 새 항목 없음 — 종료")
+                break
+
+        await browser.close()
+
     with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerow(HEADERS_ROW)
-        writer.writerows(all_rows)
+        w = csv.writer(f)
+        w.writerow(HEADERS_ROW)
+        for i, r in enumerate(rows):
+            r[0] = str(i + 1)
+            w.writerow(r)
 
-    print(f"[elancer] 완료: {len(all_rows)}건 → {CSV_PATH}")
-    return CSV_PATH
+    print(f"[elancer] 완료: {len(rows)}건 → {CSV_PATH}")
 
 
 if __name__ == "__main__":
-    path = crawl()
-    print(f"CSV saved: {path}")
+    asyncio.run(crawl())
