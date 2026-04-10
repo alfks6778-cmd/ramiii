@@ -1,7 +1,8 @@
-name: "Gigs Competitor → CSV → Sheet"
+name: "Gigs Competitor → Apps Script Webhook"
 
 on:
   schedule:
+    # 매주 월요일 09:00 KST (= UTC 00:00)
     - cron: "0 0 * * 1"
   workflow_dispatch:
     inputs:
@@ -27,7 +28,7 @@ env:
   PYTHON_VERSION: "3.11"
 
 jobs:
-  crawl-and-upload:
+  crawl:
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -35,10 +36,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install Python dependencies
         run: |
@@ -48,54 +49,56 @@ jobs:
       - name: Install Playwright Chromium
         run: playwright install chromium --with-deps
 
-      - name: Write GCP service account JSON
-        run: echo '${{ secrets.GCP_SA_JSON }}' > sa.json
-
       - name: Create output directory
-        run: mkdir -p out/debug
+        run: mkdir -p ${{ env.OUT_DIR }}/debug
 
-      - name: "Crawl: 이랜서"
-        if: inputs.skip_elancer != true
+      # ── 크롤러 실행 ───────────────────────────────────
+      - name: "Crawl: 이랜서 (API)"
+        if: ${{ github.event.inputs.skip_elancer != 'true' }}
+        continue-on-error: true
         run: python crawlers/elancer_crawler.py
         env:
-          OUT_DIR: out
+          OUT_DIR: ${{ env.OUT_DIR }}
 
-      - name: "Crawl: 위시켓"
-        if: inputs.skip_wishket != true
+      - name: "Crawl: 위시켓 (Playwright)"
+        if: ${{ github.event.inputs.skip_wishket != 'true' }}
+        continue-on-error: true
         run: python crawlers/wishket_crawler.py
         env:
-          OUT_DIR: out
+          OUT_DIR: ${{ env.OUT_DIR }}
 
-      - name: "Crawl: 크몽"
-        if: inputs.skip_kmong != true
+      - name: "Crawl: 크몽 (Playwright)"
+        if: ${{ github.event.inputs.skip_kmong != 'true' }}
+        continue-on-error: true
         run: python crawlers/kmong_crawler.py
         env:
-          OUT_DIR: out
+          OUT_DIR: ${{ env.OUT_DIR }}
 
       - name: List collected CSVs
         run: |
           echo "=== Collected CSV files ==="
-          ls -la out/*.csv 2>/dev/null || echo "No CSV files found"
+          ls -la ${{ env.OUT_DIR }}/*.csv 2>/dev/null || echo "No CSV files found"
+          for f in ${{ env.OUT_DIR }}/*.csv; do
+            if [ -f "$f" ]; then
+              echo "--- $f ---"
+              wc -l "$f"
+            fi
+          done
 
-      - name: "Pipeline: CSV → Google Sheet"
-        run: python pipeline/gsheet_pipeline.py
+      # ── Apps Script 웹훅으로 전송 ────────────────────
+      - name: "Pipeline: CSV → Apps Script Webhook"
+        run: python pipeline/webhook_pipeline.py
         env:
-          OUT_DIR: out
-          SA_JSON_PATH: sa.json
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          SHEET_GID: ${{ secrets.SHEET_GID }}
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          OUT_DIR: ${{ env.OUT_DIR }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          SHARED_SECRET: ${{ secrets.SHARED_SECRET }}
 
-      - name: Upload CSV artifacts
+      - name: Upload CSV + debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: gigs-artifacts
           path: |
-            out/*.csv
-            out/debug/
+            ${{ env.OUT_DIR }}/*.csv
+            ${{ env.OUT_DIR }}/debug/
           retention-days: 30
-
-      - name: Cleanup service account
-        if: always()
-        run: rm -f sa.json
