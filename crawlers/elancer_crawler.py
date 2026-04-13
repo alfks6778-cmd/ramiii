@@ -1,7 +1,9 @@
 """
-이랜서(Elancer) 크롤러 — Playwright 기반 (v4 homepage-discover)
-- 홈페이지에서 프로젝트 목록 링크 자동 발견
-- 후보 URL + 홈페이지 네비 링크 탐색
+이랜서(Elancer) 크롤러 — Playwright 기반 (v5 XHR intercept)
+- /list-partner 페이지 + 홈페이지 접근
+- XHR 응답 가로채기로 API 데이터 자동 캡처
+- DOM broad 추출 fallback
+- 모든 링크 패턴 디버그 덤프
 """
 
 import asyncio
@@ -12,21 +14,14 @@ import re
 from datetime import datetime
 from playwright.async_api import async_playwright
 
-HOMEPAGE = "https://www.elancer.co.kr/"
-# 홈페이지 발견 전 우선 시도할 URL (흔한 패턴)
-SEED_URLS = [
-    "https://www.elancer.co.kr/project/pjtList",
-    "https://www.elancer.co.kr/project/list",
-    "https://www.elancer.co.kr/project",
-    "https://www.elancer.co.kr/project/search",
-    "https://www.elancer.co.kr/project/pjt_list",
-    "https://www.elancer.co.kr/freelance/project",
-    "https://www.elancer.co.kr/outsource/project",
-    "https://www.elancer.co.kr/project/projectList",
-    "https://www.elancer.co.kr/project/all",
+URLS_TO_TRY = [
+    "https://www.elancer.co.kr/list-partner",
+    "https://www.elancer.co.kr/list-partner?pf=턴키",
+    "https://www.elancer.co.kr/list-partner?pf=상주",
+    "https://www.elancer.co.kr/",
 ]
 PAGE_TIMEOUT = 60000
-MAX_PAGES = 10
+MAX_PAGES = 5
 HEADERS_ROW = [
     "No.", "플랫폼", "프로젝트 제목", "등록일", "금액",
     "예상기간", "기간제/외주", "직무", "스킬", "근무지", "수집일시",
@@ -36,6 +31,9 @@ OUT_DIR = os.environ.get("OUT_DIR", "out")
 DEBUG_DIR = os.path.join(OUT_DIR, "debug")
 TODAY = datetime.now().strftime("%y%m%d")
 CSV_PATH = os.path.join(OUT_DIR, f"elancer_{TODAY}.csv")
+
+# XHR로 캡처한 프로젝트 데이터
+captured_api_items = []
 
 
 async def dump_debug(page, name: str):
@@ -49,74 +47,211 @@ async def dump_debug(page, name: str):
         print(f"[elancer] 디버그 저장 실패: {e}")
 
 
-async def extract_cards(page) -> list:
-    """프로젝트 상세 링크를 찾아 카드 추출"""
+async def dump_all_links(page, name: str):
+    """디버그: 페이지의 모든 링크 패턴 저장"""
+    links = await page.evaluate("""() => {
+        return Array.from(document.querySelectorAll('a')).map(a => ({
+            href: a.getAttribute('href') || '',
+            text: (a.innerText || '').trim().slice(0, 80),
+        })).filter(x => x.href && x.href !== '#');
+    }""")
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    with open(os.path.join(DEBUG_DIR, f"elancer_{name}_links.json"), "w", encoding="utf-8") as f:
+        json.dump(links, f, ensure_ascii=False, indent=2)
+    print(f"[elancer] 페이지 링크 {len(links)}개 저장됨")
+    for link in links[:20]:
+        print(f"  → {link['href'][:80]} | {link['text'][:40]}")
+    return links
+
+
+def on_response(response):
+    """XHR/Fetch 응답 가로채기 — JSON에서 프로젝트 데이터 추출"""
+    url = response.url
+    ct = response.headers.get("content-type", "")
+    if "json" not in ct and "javascript" not in ct:
+        return
+    try:
+        # 비동기 함수 안에서 호출되므로 동기로 처리 불가
+        # 대신 URL만 기록하고 나중에 처리
+        pass
+    except Exception:
+        pass
+
+
+async def capture_xhr(page, url: str):
+    """페이지 로드하면서 모든 JSON 응답 캡처"""
+    captured = []
+
+    async def handle_response(response):
+        ct = response.headers.get("content-type", "")
+        resp_url = response.url
+        if "json" in ct or "javascript" in ct:
+            try:
+                body = await response.text()
+                if len(body) > 100:  # 의미 있는 크기만
+                    try:
+                        data = json.loads(body)
+                        captured.append({"url": resp_url, "data": data})
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    page.on("response", handle_response)
+
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
+        # AJAX 로딩 대기
+        await page.wait_for_timeout(5000)
+    except Exception as e:
+        print(f"[elancer] 페이지 로드 실패: {e}")
+
+    page.remove_listener("response", handle_response)
+    return captured
+
+
+def extract_projects_from_json(captured: list) -> list:
+    """캡처된 JSON 응답에서 프로젝트 데이터 추출"""
+    results = []
+
+    def walk(node, depth=0):
+        if depth > 10:
+            return
+        if isinstance(node, list):
+            # 리스트 내 항목이 프로젝트처럼 보이는지 확인
+            project_like = []
+            for item in node:
+                if isinstance(item, dict):
+                    keys_str = " ".join(str(k).lower() for k in item.keys())
+                    # 프로젝트 관련 키가 있으면 후보
+                    if any(kw in keys_str for kw in [
+                        "pjt", "project", "title", "subject", "name",
+                        "budget", "period", "skill", "duty", "area",
+                    ]):
+                        project_like.append(item)
+            if len(project_like) >= 3:
+                results.extend(project_like)
+            for item in node:
+                walk(item, depth + 1)
+        elif isinstance(node, dict):
+            for v in node.values():
+                walk(v, depth + 1)
+
+    for cap in captured:
+        walk(cap["data"])
+
+    # 중복 제거 (title 기준)
+    seen = set()
+    deduped = []
+    for item in results:
+        title = ""
+        for k in ["pjtTitle", "title", "subject", "projectTitle", "pjt_title", "name"]:
+            if k in item and item[k]:
+                title = str(item[k]).strip()
+                break
+        if title and title not in seen:
+            seen.add(title)
+            deduped.append(item)
+
+    return deduped
+
+
+def _get(item: dict, *keys, default=""):
+    for k in keys:
+        v = item.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return default
+
+
+def json_item_to_row(item: dict, now_str: str) -> list:
+    title = _get(item, "pjtTitle", "title", "subject", "projectTitle", "pjt_title", "name")
+    regdate = _get(item, "regDate", "reg_date", "createdAt", "created_at", "createDate")[:10]
+
+    amount = _get(item, "budget", "pjtBudget", "amount", "price")
+    if not amount:
+        bmin = item.get("budgetMin") or item.get("minBudget")
+        bmax = item.get("budgetMax") or item.get("maxBudget")
+        if bmin and bmax:
+            amount = f"{bmin}~{bmax}"
+
+    duration = _get(item, "period", "pjtPeriod", "duration", "expectedPeriod", "workPeriod")
+    work_type = _get(item, "pjtType", "workType", "type", "pf")
+    job = _get(item, "duty", "dutyName", "job", "category", "field")
+    skill = _get(item, "skill", "skills", "techStack", "pjtSkill")
+    location = _get(item, "area", "location", "region", "pjtArea", "workArea")
+
+    return [
+        "", "이랜서", title[:200], regdate, amount,
+        duration, work_type, job, skill[:100], location, now_str,
+    ]
+
+
+async def extract_dom_broad(page) -> list:
+    """폭넓은 DOM 추출 — 반복되는 카드형 요소 탐색"""
     return await page.evaluate("""() => {
-        const candidates = document.querySelectorAll('a');
+        // 모든 a 태그의 href 중 숫자 ID를 포함한 것
+        const links = document.querySelectorAll('a');
         const seen = new Set();
         const result = [];
-        for (const a of candidates) {
+        for (const a of links) {
             const href = a.getAttribute('href') || '';
-            // 프로젝트 ID 포함 링크 패턴 (다양한 패턴 대응)
-            const pidMatch =
-                href.match(/[?&](?:pjt_no|project_no|projectId|pjtId|pjt_id|pjtNo|projectNo)=(\\d+)/i) ||
-                href.match(/\\/project[_/](?:view|detail|info)?[=/]?(\\d+)/i) ||
-                href.match(/\\/pjt[_/](?:view|detail)?[=/]?(\\d+)/i) ||
-                href.match(/\\/(?:project|pjt)\\/(\\d{4,})/i);
-            if (!pidMatch) continue;
-            const pid = pidMatch[1];
+            // 다양한 ID 패턴
+            const m = href.match(/(\\d{3,})/);
+            if (!m) continue;
+            const pid = m[1];
             if (seen.has(pid)) continue;
             seen.add(pid);
+            // 부모 컨테이너 탐색
             let node = a;
-            for (let i = 0; i < 6; i++) {
+            for (let i = 0; i < 8; i++) {
                 if (!node.parentElement) break;
                 node = node.parentElement;
-                if (node.innerText && node.innerText.length > 100) break;
+                if (node.innerText && node.innerText.length > 60) break;
             }
+            const text = (node.innerText || '').trim();
+            if (text.length < 20) continue;
             result.push({
                 pid: pid,
                 href: href,
                 title: (a.innerText || a.getAttribute('title') || '').trim(),
-                text: (node.innerText || '').trim().slice(0, 1000),
+                text: text.slice(0, 1000),
             });
+        }
+
+        // Fallback: 반복 패턴 찾기 — 같은 class의 div/li 중 텍스트 50자 이상
+        if (result.length === 0) {
+            const allElems = document.querySelectorAll('div, li, article, section');
+            const classGroups = {};
+            for (const el of allElems) {
+                const cls = el.className || '';
+                if (!cls || el.innerText.trim().length < 30) continue;
+                if (!classGroups[cls]) classGroups[cls] = [];
+                classGroups[cls].push(el);
+            }
+            // 3개 이상 반복되는 그룹 = 카드 패턴
+            for (const [cls, els] of Object.entries(classGroups)) {
+                if (els.length >= 3 && els.length <= 100) {
+                    for (const el of els) {
+                        const text = el.innerText.trim();
+                        if (text.length > 30) {
+                            result.push({
+                                pid: 'dom_' + result.length,
+                                href: '',
+                                title: text.split('\\n')[0].slice(0, 100),
+                                text: text.slice(0, 1000),
+                            });
+                        }
+                    }
+                    if (result.length > 0) break;
+                }
+            }
         }
         return result;
     }""")
 
 
-async def discover_from_homepage(page) -> list:
-    """홈페이지에서 프로젝트 목록 페이지 후보 링크 추출"""
-    return await page.evaluate("""() => {
-        const links = document.querySelectorAll('a');
-        const candidates = [];
-        for (const a of links) {
-            const href = a.getAttribute('href') || '';
-            const text = (a.innerText || '').trim();
-            // 상세 페이지 제외 (ID 포함된 URL은 제외)
-            if (/\\d{4,}/.test(href)) continue;
-            // 후보: href에 project/pjt가 들어가거나, 텍스트에 "프로젝트 찾기/목록/리스트" 포함
-            const hrefMatch = /project|pjt|outsource|freelance/i.test(href);
-            const textMatch = /프로젝트|외주|찾기|목록/.test(text);
-            if (hrefMatch || textMatch) {
-                // 절대 URL 변환
-                let abs = href;
-                if (href.startsWith('/')) abs = location.origin + href;
-                else if (!href.startsWith('http')) continue;
-                if (!abs.includes('elancer.co.kr')) continue;
-                candidates.push({href: abs, text: text.slice(0, 50)});
-            }
-        }
-        // 중복 제거
-        const seen = new Set();
-        return candidates.filter(c => {
-            if (seen.has(c.href)) return false;
-            seen.add(c.href);
-            return true;
-        });
-    }""")
-
-
-def parse_card(card: dict) -> dict:
+def parse_dom_card(card: dict, now_str: str) -> list:
     text = card.get("text", "")
     title = card.get("title") or ""
     if not title:
@@ -144,34 +279,15 @@ def parse_card(card: dict) -> dict:
         location = m.group(0)
 
     job = ""
-    for kw in ["개발", "디자인", "기획", "퍼블리싱", "데이터", "인프라", "QA", "PM"]:
+    for kw in ["개발", "SI", "디자인", "기획", "퍼블", "데이터", "인프라", "QA", "PM"]:
         if kw in text:
             job = kw
             break
 
-    return {
-        "title": title[:200],
-        "amount": amount,
-        "duration": duration,
-        "regdate": regdate,
-        "location": location,
-        "job": job,
-    }
-
-
-async def try_url(page, url: str) -> tuple:
-    """URL 시도 → (status, cards 개수) 반환"""
-    try:
-        resp = await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
-        await page.wait_for_timeout(2500)
-        status = resp.status if resp else 0
-        if status >= 400:
-            return status, []
-        cards = await extract_cards(page)
-        return status, cards
-    except Exception as e:
-        print(f"[elancer]   예외: {e}")
-        return 0, []
+    return [
+        "", "이랜서", title[:200], regdate, amount,
+        duration, "", job, "", location, now_str,
+    ]
 
 
 async def crawl():
@@ -193,83 +309,54 @@ async def crawl():
 
         print("[elancer] 수집 시작")
 
-        # 1. SEED URL 시도
-        working_url = None
-        for url in SEED_URLS:
-            print(f"[elancer] seed 시도: {url}")
-            status, cards = await try_url(page, url)
-            print(f"[elancer]   status={status}, 카드 {len(cards)}개")
-            if status == 200 and cards:
-                working_url = url
-                break
+        for url in URLS_TO_TRY:
+            print(f"[elancer] XHR 캡처 시도: {url}")
 
-        # 2. SEED 실패 → 홈페이지에서 링크 발견
-        if not working_url:
-            print("[elancer] 홈페이지에서 링크 탐색")
-            try:
-                await page.goto(HOMEPAGE, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
-                await page.wait_for_timeout(3000)
-                await dump_debug(page, "homepage")
-                discovered = await discover_from_homepage(page)
-                print(f"[elancer] 홈페이지 후보 링크 {len(discovered)}개")
-                for d in discovered[:15]:
-                    print(f"  → {d['text']} | {d['href']}")
-                    status, cards = await try_url(page, d['href'])
-                    print(f"    status={status}, 카드 {len(cards)}개")
-                    if status == 200 and cards:
-                        working_url = d['href']
-                        break
-            except Exception as e:
-                print(f"[elancer] 홈페이지 탐색 실패: {e}")
+            # XHR 응답 캡처하면서 페이지 로드
+            captured = await capture_xhr(page, url)
+            print(f"[elancer]   JSON 응답 {len(captured)}개 캡처")
 
-        if not working_url:
-            print("[elancer] 접근 가능한 URL 없음")
-            await dump_debug(page, "no_url")
-            await browser.close()
-            with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
-                csv.writer(f).writerow(HEADERS_ROW)
-            return
+            # 캡처된 JSON 저장 (디버그)
+            if captured:
+                os.makedirs(DEBUG_DIR, exist_ok=True)
+                safe_name = url.split("/")[-1][:30].replace("?", "_")
+                with open(os.path.join(DEBUG_DIR, f"elancer_xhr_{safe_name}.json"), "w", encoding="utf-8") as f:
+                    summary = [{"url": c["url"][:200], "keys": list(c["data"].keys()) if isinstance(c["data"], dict) else f"array[{len(c['data'])}]" if isinstance(c["data"], list) else type(c["data"]).__name__} for c in captured]
+                    json.dump(summary, f, ensure_ascii=False, indent=2)
 
-        print(f"[elancer] 사용 URL: {working_url}")
-        await dump_debug(page, "page1")
+            # JSON에서 프로젝트 추출
+            projects = extract_projects_from_json(captured)
+            print(f"[elancer]   JSON 프로젝트 {len(projects)}개")
 
-        # 3. 페이지네이션
-        for pg in range(1, MAX_PAGES + 1):
-            if pg > 1:
-                sep = "&" if "?" in working_url else "?"
-                url = f"{working_url}{sep}page={pg}"
-                print(f"[elancer] page {pg}: {url}")
-                try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
-                    await page.wait_for_timeout(3000)
-                except Exception as e:
-                    print(f"[elancer] page {pg} 실패: {e}")
-                    break
+            if projects:
+                for item in projects:
+                    title = _get(item, "pjtTitle", "title", "subject", "projectTitle", "name")
+                    if not title or title in seen:
+                        continue
+                    seen.add(title)
+                    rows.append(json_item_to_row(item, now_str))
+                print(f"[elancer]   JSON에서 {len(rows)}건 추출")
 
-            cards = await extract_cards(page)
-            print(f"[elancer] page {pg} 카드 {len(cards)}개")
+            # DOM도 시도
+            await dump_debug(page, url.split("/")[-1][:20].replace("?", "_"))
+            await dump_all_links(page, url.split("/")[-1][:20].replace("?", "_"))
 
-            if not cards:
-                await dump_debug(page, f"empty_p{pg}")
-                break
+            dom_cards = await extract_dom_broad(page)
+            print(f"[elancer]   DOM 카드 {len(dom_cards)}개")
 
-            new_count = 0
-            for c in cards:
+            for c in dom_cards:
                 pid = c["pid"]
-                if pid in seen:
+                title_key = c.get("title", "")[:50]
+                key = pid if pid and not pid.startswith("dom_") else title_key
+                if not key or key in seen:
                     continue
-                seen.add(pid)
-                parsed = parse_card(c)
-                if not parsed["title"]:
-                    continue
-                rows.append([
-                    "", "이랜서", parsed["title"], parsed["regdate"], parsed["amount"],
-                    parsed["duration"], "", parsed["job"], "", parsed["location"], now_str,
-                ])
-                new_count += 1
+                seen.add(key)
+                row = parse_dom_card(c, now_str)
+                if row[2] and len(row[2]) > 5:
+                    rows.append(row)
 
-            if new_count == 0:
-                print(f"[elancer] page {pg} 새 항목 없음 — 종료")
+            if rows:
+                print(f"[elancer] {url}에서 총 {len(rows)}건 — 수집 완료")
                 break
 
         await browser.close()
