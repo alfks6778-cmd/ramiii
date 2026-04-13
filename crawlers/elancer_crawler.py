@@ -1,8 +1,7 @@
 """
-이랜서(Elancer) 크롤러 — Playwright 기반 (v3 scrape)
-- API가 HTML 반환하므로 웹페이지 직접 스크레이핑
-- 후보 URL: /project, /project_list, /pjt 등 시도
-- DOM 자동분석
+이랜서(Elancer) 크롤러 — Playwright 기반 (v4 homepage-discover)
+- 홈페이지에서 프로젝트 목록 링크 자동 발견
+- 후보 URL + 홈페이지 네비 링크 탐색
 """
 
 import asyncio
@@ -13,12 +12,18 @@ import re
 from datetime import datetime
 from playwright.async_api import async_playwright
 
-CANDIDATE_URLS = [
-    "https://www.elancer.co.kr/project",
-    "https://www.elancer.co.kr/project_list",
-    "https://www.elancer.co.kr/pjt",
+HOMEPAGE = "https://www.elancer.co.kr/"
+# 홈페이지 발견 전 우선 시도할 URL (흔한 패턴)
+SEED_URLS = [
+    "https://www.elancer.co.kr/project/pjtList",
     "https://www.elancer.co.kr/project/list",
-    "https://www.elancer.co.kr/",
+    "https://www.elancer.co.kr/project",
+    "https://www.elancer.co.kr/project/search",
+    "https://www.elancer.co.kr/project/pjt_list",
+    "https://www.elancer.co.kr/freelance/project",
+    "https://www.elancer.co.kr/outsource/project",
+    "https://www.elancer.co.kr/project/projectList",
+    "https://www.elancer.co.kr/project/all",
 ]
 PAGE_TIMEOUT = 60000
 MAX_PAGES = 10
@@ -52,8 +57,12 @@ async def extract_cards(page) -> list:
         const result = [];
         for (const a of candidates) {
             const href = a.getAttribute('href') || '';
-            const pidMatch = href.match(/(?:pjt_no|project[_/](?:view)?|pjt[_/]view)[=/]?(\\d+)/i)
-                          || href.match(/\\/(?:project|pjt)\\/(\\d+)/i);
+            // 프로젝트 ID 포함 링크 패턴 (다양한 패턴 대응)
+            const pidMatch =
+                href.match(/[?&](?:pjt_no|project_no|projectId|pjtId|pjt_id|pjtNo|projectNo)=(\\d+)/i) ||
+                href.match(/\\/project[_/](?:view|detail|info)?[=/]?(\\d+)/i) ||
+                href.match(/\\/pjt[_/](?:view|detail)?[=/]?(\\d+)/i) ||
+                href.match(/\\/(?:project|pjt)\\/(\\d{4,})/i);
             if (!pidMatch) continue;
             const pid = pidMatch[1];
             if (seen.has(pid)) continue;
@@ -72,6 +81,38 @@ async def extract_cards(page) -> list:
             });
         }
         return result;
+    }""")
+
+
+async def discover_from_homepage(page) -> list:
+    """홈페이지에서 프로젝트 목록 페이지 후보 링크 추출"""
+    return await page.evaluate("""() => {
+        const links = document.querySelectorAll('a');
+        const candidates = [];
+        for (const a of links) {
+            const href = a.getAttribute('href') || '';
+            const text = (a.innerText || '').trim();
+            // 상세 페이지 제외 (ID 포함된 URL은 제외)
+            if (/\\d{4,}/.test(href)) continue;
+            // 후보: href에 project/pjt가 들어가거나, 텍스트에 "프로젝트 찾기/목록/리스트" 포함
+            const hrefMatch = /project|pjt|outsource|freelance/i.test(href);
+            const textMatch = /프로젝트|외주|찾기|목록/.test(text);
+            if (hrefMatch || textMatch) {
+                // 절대 URL 변환
+                let abs = href;
+                if (href.startsWith('/')) abs = location.origin + href;
+                else if (!href.startsWith('http')) continue;
+                if (!abs.includes('elancer.co.kr')) continue;
+                candidates.push({href: abs, text: text.slice(0, 50)});
+            }
+        }
+        // 중복 제거
+        const seen = new Set();
+        return candidates.filter(c => {
+            if (seen.has(c.href)) return false;
+            seen.add(c.href);
+            return true;
+        });
     }""")
 
 
@@ -118,6 +159,21 @@ def parse_card(card: dict) -> dict:
     }
 
 
+async def try_url(page, url: str) -> tuple:
+    """URL 시도 → (status, cards 개수) 반환"""
+    try:
+        resp = await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
+        await page.wait_for_timeout(2500)
+        status = resp.status if resp else 0
+        if status >= 400:
+            return status, []
+        cards = await extract_cards(page)
+        return status, cards
+    except Exception as e:
+        print(f"[elancer]   예외: {e}")
+        return 0, []
+
+
 async def crawl():
     os.makedirs(OUT_DIR, exist_ok=True)
     os.makedirs(DEBUG_DIR, exist_ok=True)
@@ -136,24 +192,35 @@ async def crawl():
         page = await context.new_page()
 
         print("[elancer] 수집 시작")
+
+        # 1. SEED URL 시도
         working_url = None
-        for url in CANDIDATE_URLS:
+        for url in SEED_URLS:
+            print(f"[elancer] seed 시도: {url}")
+            status, cards = await try_url(page, url)
+            print(f"[elancer]   status={status}, 카드 {len(cards)}개")
+            if status == 200 and cards:
+                working_url = url
+                break
+
+        # 2. SEED 실패 → 홈페이지에서 링크 발견
+        if not working_url:
+            print("[elancer] 홈페이지에서 링크 탐색")
             try:
-                print(f"[elancer] 시도: {url}")
-                resp = await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
+                await page.goto(HOMEPAGE, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
                 await page.wait_for_timeout(3000)
-                status = resp.status if resp else 0
-                print(f"[elancer]   status={status}")
-                if status and status < 400:
-                    test_cards = await extract_cards(page)
-                    print(f"[elancer]   테스트 카드 {len(test_cards)}개")
-                    if test_cards:
-                        working_url = url
+                await dump_debug(page, "homepage")
+                discovered = await discover_from_homepage(page)
+                print(f"[elancer] 홈페이지 후보 링크 {len(discovered)}개")
+                for d in discovered[:15]:
+                    print(f"  → {d['text']} | {d['href']}")
+                    status, cards = await try_url(page, d['href'])
+                    print(f"    status={status}, 카드 {len(cards)}개")
+                    if status == 200 and cards:
+                        working_url = d['href']
                         break
-                    elif url == CANDIDATE_URLS[0]:
-                        working_url = url
             except Exception as e:
-                print(f"[elancer]   실패: {e}")
+                print(f"[elancer] 홈페이지 탐색 실패: {e}")
 
         if not working_url:
             print("[elancer] 접근 가능한 URL 없음")
@@ -166,6 +233,7 @@ async def crawl():
         print(f"[elancer] 사용 URL: {working_url}")
         await dump_debug(page, "page1")
 
+        # 3. 페이지네이션
         for pg in range(1, MAX_PAGES + 1):
             if pg > 1:
                 sep = "&" if "?" in working_url else "?"
